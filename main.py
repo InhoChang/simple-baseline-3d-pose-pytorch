@@ -9,14 +9,10 @@ from __future__ import print_function, absolute_import, division
 
 import os
 import sys
-import time
-from pprint import pprint
-import numpy as np
-from tqdm import trange
 from tqdm import tqdm
 
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
 
@@ -31,7 +27,6 @@ from torch.autograd import Variable
 from opt import Options
 from src.procrustes import get_transformation
 import src.data_process as data_process
-from src import Bar
 import src.utils as utils
 import src.misc as misc
 import src.log as log
@@ -89,24 +84,6 @@ def main(opt):
     stat_3d = torch.load(os.path.join(opt.data_dir, 'stat_3d.pth.tar'))
     stat_2d = torch.load(os.path.join(opt.data_dir, 'stat_2d.pth.tar'))
 
-
-    ## stat_3d.keys() =>  dict_keys(['std', 'dim_use', 'train', 'test', 'mean'])
-    ## std => (96., )
-    ## mean => (96.,)
-    ## dim_use => (48, ) ?????
-    # train => dict{[user, action, camera_id]} ex) dict{[6, 'Walking', 'Walking 1.60457274.h5']} // data = int // len 600 = 15 actions * 8 cameras+extra_actions * 5 users
-    # test => same as train, user = 9, 11 // len 240
-    # (7,
-    #  'Photo',
-    #  'Photo 1.58860488.h5'): array([[514.54570615, -606.40670751, 5283.29114444],
-    #                                 [513.19690503, -606.27874917, 5282.94296128],
-    #                                 [511.72623278, -606.3556718, 5282.09161439],
-    #                                 ...,
-    #                                 [660.21544235, -494.87670603, 5111.48298849],
-    #                                 [654.79473179, -497.67942449, 5111.05843265],
-    #                                 [649.61962945, -498.74291164, 5111.91590807]])}
-
-
     # test
     if opt.test:
         err_set = []
@@ -114,7 +91,7 @@ def main(opt):
             print (">>> TEST on _{}_".format(action))
 
             test_loader = DataLoader(
-                dataset=Human36M(actions=action, data_path=opt.data_dir, use_hg=opt.use_hg, is_train=False),
+                dataset=Human36M(actions=action, data_path=opt.data_dir,set_num_samples = opt.set_num_samples, use_hg=opt.use_hg, is_train=False),
                 batch_size=opt.test_batch,
                 shuffle=False,
                 num_workers=opt.job,
@@ -136,14 +113,14 @@ def main(opt):
 
     # load datasets for training
     test_loader = DataLoader(
-        dataset=Human36M(actions=actions, data_path=opt.data_dir, use_hg=opt.use_hg, is_train=False),
+        dataset=Human36M(actions=actions, data_path=opt.data_dir, set_num_samples = opt.set_num_samples, use_hg=opt.use_hg, is_train=False),
         batch_size=opt.test_batch,
         shuffle=False,
         num_workers=opt.job,
         pin_memory=True)
 
     train_loader = DataLoader(
-        dataset=Human36M(actions=actions, data_path=opt.data_dir, use_hg=opt.use_hg),
+        dataset=Human36M(actions=actions, data_path=opt.data_dir, set_num_samples = opt.set_num_samples, use_hg=opt.use_hg),
         batch_size=opt.train_batch,
         shuffle=True,
         num_workers=opt.job,
@@ -160,11 +137,11 @@ def main(opt):
         ## per epoch
         # train
         glob_step, lr_now, loss_train = train(
-            train_loader, model, criterion, optimizer,
+            train_loader, model, criterion, optimizer, stat_2d, stat_3d,
             lr_init=opt.lr, lr_now=lr_now, glob_step=glob_step, lr_decay=opt.lr_decay, gamma=opt.lr_gamma,
             max_norm=opt.max_norm)
         # test
-        loss_test, err_test = test(test_loader, model, criterion, stat_3d, procrustes=opt.procrustes)
+        loss_test, err_test = test(test_loader, model, criterion, stat_2d, stat_3d, procrustes=opt.procrustes)
         # loss_test, err_test = test(test_loader, model, criterion, stat_3d, procrustes=True)
 
         # update log file
@@ -197,17 +174,14 @@ def main(opt):
     logger.close()
 
 
-def train(train_loader, model, criterion, optimizer,
+def train(train_loader, model, criterion, optimizer, stat_2d, stat_3d,
           lr_init=None, lr_now=None, glob_step=None, lr_decay=None, gamma=None,
-          max_norm=True):
+          max_norm=True ):
 
     losses = utils.AverageMeter()
 
     model.train()
 
-    # start = time.time()
-    # batch_time = 0
-    # bar = Bar('>>>', fill='>', max=len(train_loader))
 
     # for i, (inps, tars) in enumerate(train_loader): # inps = (64, 32)
     pbar = tqdm(train_loader)
@@ -215,8 +189,28 @@ def train(train_loader, model, criterion, optimizer,
         glob_step += 1
         if glob_step % lr_decay == 0 or glob_step == 1:
             lr_now = utils.lr_decay(optimizer, glob_step, lr_init, lr_decay, gamma)
-        inputs = Variable(inps.cuda())
-        targets = Variable(tars.cuda(async=True))
+
+        ### Input unnormalization
+        inputs_unnorm = data_process.unNormalizeData(inps.data.cpu().numpy(), stat_2d['mean'], stat_2d['std'], stat_2d['dim_use']) # 64, 64
+        dim_2d_use = stat_2d['dim_use']
+        inputs_use = inputs_unnorm[:, dim_2d_use]  # (64, 32)
+        ### Input distance normalization
+        inputs_dist_norm, _ = data_process.input_norm(inputs_use) # (64, 32) , array
+        input_dist = torch.tensor(inputs_dist_norm, dtype=torch.float32)
+
+        ### Targets unnormalization
+        targets_unnorm = data_process.unNormalizeData(tars.data.cpu().numpy(), stat_3d['mean'], stat_3d['std'], stat_3d['dim_use']) # (64, 96)
+        dim_3d_use = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 18, 19, 20, 21, 22,
+                               23, 24, 25, 26, 36, 37, 38, 39, 40, 41, 45, 46, 47, 51, 52, 53, 54, 55, 56, 57, 58,
+                               59, 75, 76, 77, 78, 79, 80, 81, 82, 83])
+        targets_use = targets_unnorm[:, dim_3d_use] # (51, )
+
+        ### Targets distance normalization
+        targets_dist_norm, _  = data_process.output_norm(targets_use)
+        targets_dist = torch.tensor(targets_dist_norm, dtype=torch.float32)
+
+        inputs = Variable(input_dist.cuda())
+        targets = Variable(targets_dist.cuda(async=True))
 
         outputs = model(inputs)
 
@@ -234,68 +228,76 @@ def train(train_loader, model, criterion, optimizer,
         pbar.set_postfix(tr_loss='{:05.6f}'.format(losses.avg))
 
 
-
-
-    #     # update summary
-    #     if (i + 1) % 100 == 0:
-    #         batch_time = time.time() - start
-    #         start = time.time()
-    #
-    #     bar.suffix = '({batch}/{size}) | batch: {batchtime:.4}ms | Total: {ttl} | ETA: {eta:} | loss: {loss:.4f}' \
-    #         .format(batch=i + 1,
-    #                 size=len(train_loader),
-    #                 batchtime=batch_time * 10.0,
-    #                 ttl=bar.elapsed_td,
-    #                 eta=bar.eta_td,
-    #                 loss=losses.avg)
-    #     bar.next()
-    #
-    # bar.finish()
-
     return glob_step, lr_now, losses.avg
 
 # def test(test_loader, model, criterion, stat2d, stat_3d, procrustes=False):
 
-def test(test_loader, model, criterion, stat_3d, procrustes=False):
+def test(test_loader, model, criterion, stat_2d, stat_3d, procrustes=False):
 
     losses = utils.AverageMeter()
 
     model.eval()
 
     all_dist = []
-    # start = time.time()
-    # batch_time = 0
-    # bar = Bar('>>>', fill='>', max=len(test_loader))
-
-    # for i, (inps, tars) in enumerate(test_loader):
 
     pbar = tqdm(test_loader)
     for i, (inps, tars) in enumerate(pbar):
-        inputs = Variable(inps.cuda())
-        targets = Variable(tars.cuda(async=True))
+
+        ### input unnorm
+        data_coord = data_process.unNormalizeData(inps.data.cpu().numpy(), stat_2d['mean'], stat_2d['std'], stat_2d['dim_use']) # 64, 64
+        dim_2d_use = stat_2d['dim_use']
+        data_use = data_coord[:, dim_2d_use]  # (64, 32)
+
+        ### input dist norm
+        data_dist_norm, data_dist_set = data_process.input_norm(data_use) # (64, 32) , array
+        data_dist = torch.tensor(data_dist_norm, dtype=torch.float32)
+
+        # target unnorm
+        label_coord = data_process.unNormalizeData(tars.data.cpu().numpy(), stat_3d['mean'], stat_3d['std'], stat_3d['dim_use']) # (64, 96)
+        dim_3d_use = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 18, 19, 20, 21, 22,
+                               23, 24, 25, 26, 36, 37, 38, 39, 40, 41, 45, 46, 47, 51, 52, 53, 54, 55, 56, 57, 58,
+                               59, 75, 76, 77, 78, 79, 80, 81, 82, 83])
+
+        label_use = label_coord[:, dim_3d_use]  # (48, )
+        # target dist norm
+        label_dist_norm, label_dist_set = data_process.output_norm(label_use)
+        label_dist = torch.tensor(label_dist_norm, dtype=torch.float32)
+
+        inputs = Variable(data_dist.cuda())
+        targets = Variable(label_dist.cuda(async=True))
 
         outputs = model(inputs)
 
         # calculate loss
-        outputs_coord = outputs
-        loss = criterion(outputs_coord, targets) # 64 losses average
+        pred_coord = outputs
+        loss = criterion(pred_coord, targets) # 64 losses average
 
         losses.update(loss.item(), inputs.size(0))
 
         tars = targets
+        pred = outputs
 
-        # inputs_unnorm = data_process.unNormalizeData(inputs.data.cpu().numpy(), stat_2d['mean'], stat_2d['std'], stat_2d['dim_use'])
-        # calculate erruracy
-        targets_unnorm = data_process.unNormalizeData(tars.data.cpu().numpy(), stat_3d['mean'], stat_3d['std'], stat_3d['dim_use'])
-        outputs_unnorm = data_process.unNormalizeData(outputs.data.cpu().numpy(), stat_3d['mean'], stat_3d['std'], stat_3d['dim_use'])
-        # remove dim ignored
-        dim_use = np.hstack((np.arange(3), stat_3d['dim_use']))
-        # dim_2d_use = stat_2d['dim_use']
+        # inputs_dist_set = np.reshape(targets_dist_set, (-1, 1))
+        # inputs_dist_set = np.repeat(targets_dist_set, 48, axis=1)
 
-        # stat_3d['dim_use'] (48., )
-        outputs_use = outputs_unnorm[:, dim_use]
-        targets_use = targets_unnorm[:, dim_use] # (51, )
-        # inputs_use = inputs_unnorm[:, dim_2d_use] # (51, )
+        targets_dist = np.reshape(label_dist_set, (-1, 1))
+        targets_dist_set = np.repeat(targets_dist, 48, axis=1)
+
+        c = np.reshape( np.asarray( [0,0,10]) , (1,-1) )
+        c = np.repeat(c, 16, axis=0)
+        c = np.reshape(c, (1, -1) )
+        c = np.repeat(c, inputs.size(0) , axis=0)
+        # c_set = np.repeat(np.asarray([0,0,10]), 16, axis=0)
+
+        #### undist -> unnorm
+        outputs_undist = (pred.data.cpu().numpy() * targets_dist_set) - c
+        # outputs_undist = outputs_undist - c
+        targets_undist =  ( tars.data.cpu().numpy() * targets_dist_set ) - c
+        # targets_undist = targets_undist - c
+
+
+        outputs_use = outputs_undist
+        targets_use = targets_undist# (64, 48)
 
         if procrustes:
             for ba in range(inps.size(0)):
@@ -303,30 +305,23 @@ def test(test_loader, model, criterion, stat_3d, procrustes=False):
                 out = outputs_use[ba].reshape(-1, 3) # (17,3)
                 _, Z, T, b, c = get_transformation(gt, out, True)
                 out = (b * out.dot(T)) + c
-                outputs_use[ba, :] = out.reshape(1, 51)
+                outputs_use[ba, :] = out.reshape(1, 48)
 
         sqerr = (outputs_use - targets_use) ** 2
 
-        distance = np.zeros((sqerr.shape[0], 17))
+        # distance = np.zeros((sqerr.shape[0], 17))
+        distance = np.zeros((sqerr.shape[0], 16))
+
         dist_idx = 0
-        for k in np.arange(0, 17 * 3, 3):
+        for k in np.arange(0, 16 * 3, 3):
+        # for k in np.arange(0, 17 * 3, 3):
+
             distance[:, dist_idx] = np.sqrt(np.sum(sqerr[:, k:k + 3], axis=1))
             dist_idx += 1
         all_dist.append(distance)
 
-        # # update summary
-        # if (i + 1) % 100 == 0:
-        #     batch_time = time.time() - start
-        #     start = time.time()
-        #
-        # bar.suffix = '({batch}/{size}) | batch: {batchtime:.4}ms | Total: {ttl} | ETA: {eta:} | loss: {loss:.6f}' \
-        #     .format(batch=i + 1,
-        #             size=len(test_loader),
-        #             batchtime=batch_time * 10.0,
-        #             ttl=bar.elapsed_td,
-        #             eta=bar.eta_td,
-        #             loss=losses.avg)
-        # bar.next()
+
+
         pbar.set_postfix(tt_loss='{:05.6f}'.format(losses.avg))
 
 
@@ -340,7 +335,15 @@ def test(test_loader, model, criterion, stat_3d, procrustes=False):
 
 if __name__ == "__main__":
     option = Options().parse()
+    option.set_num_samples = -1
+    option.procrustes = False
+    option.test = False
+    option.resume = False # If you want to resume train from previous ckpt then set as True. Also, have to set option.load file path
+    # option.load = 'D:\\Workspace\\3d_pose_baseline_pytorch-master\\3d_pose_baseline_pytorch-master\\checkpoint\\test\\ckpt_best.pth.tar' # file_path where ckpt files are in
+    option.load = '' # file_path where ckpt files are in
+
+
     main(option)
-    print(main)
+    # print(main)
 
 
